@@ -86,7 +86,7 @@ def main():
 
     try:
         for selectivity in SELECTIVITIES:
-           
+
             latencies_ms = []
             returned_batches = []
 
