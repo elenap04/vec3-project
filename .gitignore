@@ -32,3 +32,6 @@ postgres_data/
 .vscode/
 .idea/
 .DS_Store
+
+# Private project documentation (local only)
+docs/TEAM_NOTES.md
