@@ -34,4 +34,4 @@ postgres_data/
 .DS_Store
 
 # Private project documentation (local only)
-docs/TEAM_NOTES.md
+.docs/TEAM_NOTES.md
