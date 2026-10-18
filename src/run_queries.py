@@ -1,6 +1,6 @@
-
 import argparse
 import json
+
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +10,7 @@ import numpy as np
 
 from src.adapters.chroma_adapter import ChromaAdapter
 from src.adapters.pgvector_adapter import PgvectorAdapter
+from src.resource_monitor import ResourceMonitor
 
 
 DATASET = Path("datasets/synthetic_10k_d128.npz")
@@ -31,6 +32,7 @@ def create_adapter(args):
 def warmup_worker(adapter, queries, indices, selectivity, count):
     for j in range(count):
         i = indices[j % len(indices)]
+
         adapter.search(
             queries[i],
             k=K,
@@ -50,8 +52,9 @@ def search_worker(adapter, queries, indices, selectivity):
             selectivity=selectivity,
         )
 
-        elapsed_ms = (perf_counter() - start) * 1000
-        results.append((i, ids, elapsed_ms))
+        latency_ms = (perf_counter() - start) * 1000
+
+        results.append((i, ids, latency_ms))
 
     return results
 
@@ -94,22 +97,21 @@ def main():
 
     with np.load(DATASET) as data:
         queries = data["queries"].copy()
+
         ground_truths = {
             s: data[f"gt_{s}"].copy()
             for s in SELECTIVITIES
         }
 
     if len(queries) < args.clients:
-        parser.error("Not enough queries for the client count")
+        parser.error("Not enough queries for client count")
 
-    # Each client gets a disjoint group of query indices.
     groups = [
-        list(range(client_id, len(queries), args.clients))
-        for client_id in range(args.clients)
+        list(range(j, len(queries), args.clients))
+        for j in range(args.clients)
     ]
 
-    # Separate adapter / connection per client.
-    adapters = [create_adapter(args) for _ in range(args.clients)]
+    adapters = []
 
     results = {
         "mode": "development_pilot",
@@ -132,123 +134,162 @@ def main():
         "filters": {},
     }
 
+    container_name = (
+        "vec3-chroma"
+        if args.db == "chroma"
+        else "vec3-postgres"
+    )
+
+    monitor = ResourceMonitor(container_name)
+
     try:
-        with ThreadPoolExecutor(
-            max_workers=args.clients
-        ) as executor:
+        adapters = [
+            create_adapter(args)
+            for _ in range(args.clients)
+        ]
 
-            for selectivity in SELECTIVITIES:
+        monitor.start()
 
-                # Warmup is not timed.
-                warmup_futures = [
-                    executor.submit(
-                        warmup_worker,
-                        adapters[j],
-                        queries,
-                        groups[j],
-                        selectivity,
-                        args.warmup_queries,
+        try:
+            with ThreadPoolExecutor(
+                max_workers=args.clients
+            ) as executor:
+
+                for selectivity in SELECTIVITIES:
+                    warmup_futures = [
+                        executor.submit(
+                            warmup_worker,
+                            adapters[j],
+                            queries,
+                            groups[j],
+                            selectivity,
+                            args.warmup_queries,
+                        )
+                        for j in range(args.clients)
+                    ]
+
+                    for future in warmup_futures:
+                        future.result()
+
+                    workload_start = perf_counter()
+
+                    futures = [
+                        executor.submit(
+                            search_worker,
+                            adapters[j],
+                            queries,
+                            groups[j],
+                            selectivity,
+                        )
+                        for j in range(args.clients)
+                    ]
+
+                    batches = [
+                        future.result()
+                        for future in futures
+                    ]
+
+                    workload_elapsed = (
+                        perf_counter() - workload_start
                     )
-                    for j in range(args.clients)
-                ]
 
-                for future in warmup_futures:
-                    future.result()
+                    returned = [None] * len(queries)
+                    latencies_ms = []
 
-                # The timed workload starts after warmup.
-                workload_start = perf_counter()
+                    for batch in batches:
+                        for i, ids, latency in batch:
+                            if returned[i] is not None:
+                                raise ValueError(
+                                    "Query executed more than once"
+                                )
 
-                futures = [
-                    executor.submit(
-                        search_worker,
-                        adapters[j],
-                        queries,
-                        groups[j],
-                        selectivity,
-                    )
-                    for j in range(args.clients)
-                ]
+                            returned[i] = ids
+                            latencies_ms.append(latency)
 
-                batches = [
-                    future.result()
-                    for future in futures
-                ]
+                    if any(ids is None for ids in returned):
+                        raise ValueError("Missing query results")
 
-                workload_elapsed = (
-                    perf_counter() - workload_start
-                )
+                    recalls = []
+                    short_results = 0
 
-                # All recall validation happens after timing.
-                returned = [None] * len(queries)
-                latencies_ms = []
-
-                for batch in batches:
-                    for i, ids, latency in batch:
-                        if returned[i] is not None:
+                    for i, ids in enumerate(returned):
+                        if len(ids) != len(set(ids)):
                             raise ValueError(
-                                "Query executed more than once"
+                                "Duplicate IDs in search results"
                             )
 
-                        returned[i] = ids
-                        latencies_ms.append(latency)
+                        if len(ids) > K:
+                            raise ValueError(
+                                "More than K results returned"
+                            )
 
-                if any(ids is None for ids in returned):
-                    raise ValueError("Missing query results")
+                        if len(ids) < K:
+                            short_results += 1
 
-                recalls = []
-                short_results = 0
-
-                for i, ids in enumerate(returned):
-                    if len(ids) != len(set(ids)):
-                        raise ValueError("Duplicate IDs")
-
-                    if len(ids) > K:
-                        raise ValueError("More than K results")
-
-                    if len(ids) < K:
-                        short_results += 1
-
-                    recalls.append(
-                        recall_at_k(
-                            ids,
-                            ground_truths[selectivity][i],
+                        recalls.append(
+                            recall_at_k(
+                                ids,
+                                ground_truths[selectivity][i],
+                            )
                         )
+
+                    mean_recall = float(np.mean(recalls))
+
+                    p50 = float(
+                        np.percentile(latencies_ms, 50)
                     )
 
-                mean_recall = float(np.mean(recalls))
-                p50 = float(np.percentile(latencies_ms, 50))
-                p95 = float(np.percentile(latencies_ms, 95))
-                p99 = float(np.percentile(latencies_ms, 99))
+                    p95 = float(
+                        np.percentile(latencies_ms, 95)
+                    )
 
-                qps = len(queries) / workload_elapsed
+                    p99 = float(
+                        np.percentile(latencies_ms, 99)
+                    )
 
-                results["filters"][str(selectivity)] = {
-                    "mean_recall_at_10": mean_recall,
-                    "min_recall_at_10": float(np.min(recalls)),
-                    "max_recall_at_10": float(np.max(recalls)),
-                    "queries_with_less_than_k": short_results,
-                    "latency_p50_ms": p50,
-                    "latency_p95_ms": p95,
-                    "latency_p99_ms": p99,
-                    "qps": float(qps),
-                    "measured_duration_seconds": workload_elapsed,
-                }
+                    qps = len(queries) / workload_elapsed
 
-                print(
-                    f"{args.db} | clients={args.clients} "
-                    f"| filter={selectivity}% "
-                    f"| recall@10={mean_recall:.4f} "
-                    f"| p50={p50:.2f} ms "
-                    f"| p95={p95:.2f} ms "
-                    f"| p99={p99:.2f} ms "
-                    f"| QPS={qps:.2f} "
-                    f"| short={short_results}"
-                )
+                    results["filters"][str(selectivity)] = {
+                        "mean_recall_at_10": mean_recall,
+                        "min_recall_at_10": float(np.min(recalls)),
+                        "max_recall_at_10": float(np.max(recalls)),
+                        "queries_with_less_than_k": short_results,
+                        "latency_p50_ms": p50,
+                        "latency_p95_ms": p95,
+                        "latency_p99_ms": p99,
+                        "qps": float(qps),
+                        "measured_duration_seconds": workload_elapsed,
+                    }
+
+                    print(
+                        f"{args.db} | clients={args.clients} "
+                        f"| filter={selectivity}% "
+                        f"| recall@10={mean_recall:.4f} "
+                        f"| p50={p50:.2f} ms "
+                        f"| p95={p95:.2f} ms "
+                        f"| p99={p99:.2f} ms "
+                        f"| QPS={qps:.2f} "
+                        f"| short={short_results}"
+                    )
+
+        finally:
+            resource_summary = monitor.stop()
 
     finally:
         if args.db == "pgvector":
             for adapter in adapters:
                 adapter.close()
+
+    results["resources"] = resource_summary
+    results["resources_scope"] = (
+        "entire_run_including_warmup"
+    )
+
+    print("\n=== RESOURCE MONITOR ===")
+    print(f"Samples: {resource_summary['sample_count']}")
+    print(f"Status: {resource_summary['status']}")
+    print(f"Peak RAM: {resource_summary['peak_memory_mib']}")
+    print(f"Mean CPU: {resource_summary['mean_cpu_percent']}")
 
     output_dir = Path("results/pilot")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -279,4 +320,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
