@@ -38,3 +38,6 @@ postgres_data/
 
 # Private team notes
 docs/TEAM_NOTES.md
+
+# Local diagnostic logs
+logs/
