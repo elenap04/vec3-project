@@ -35,3 +35,6 @@ postgres_data/
 
 # Private project documentation (local only)
 .docs/TEAM_NOTES.md
+
+# Private team notes
+docs/TEAM_NOTES.md
