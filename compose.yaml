@@ -1,0 +1,28 @@
+
+services:
+  chroma:
+    image: chromadb/chroma:1.5.9
+    container_name: vec3-chroma
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - chroma_data:/data
+    restart: "no"
+
+  postgres:
+    image: pgvector/pgvector:0.8.7-pg17-trixie
+    container_name: vec3-postgres
+    environment:
+      POSTGRES_USER: vec3
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set password in .env}"
+      POSTGRES_DB: vec3db
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    shm_size: 256mb
+    restart: "no"
+
+volumes:
+  chroma_data:
+  postgres_data:
