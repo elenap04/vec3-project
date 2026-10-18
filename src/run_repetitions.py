@@ -36,6 +36,13 @@ def main():
         default=20,
     )
 
+    parser.add_argument(
+        "--clients",
+        type=int,
+        choices=[1, 8],
+        default=1,
+    )
+
     args = parser.parse_args()
 
     if args.runs < 2:
@@ -64,6 +71,8 @@ def main():
             args.db,
             "--warmup-queries",
             str(args.warmup_queries),
+            "--clients",
+            str(args.clients),
         ]
 
         if args.db == "pgvector":
@@ -111,12 +120,17 @@ def main():
         if result["database"] != args.db:
             raise ValueError("Unexpected database")
 
+        if result["clients"] != args.clients:
+            raise ValueError("Unexpected client count")
+
         run_files.append(str(path))
         run_results.append(result)
 
     summary = {
         "mode": "development_pilot",
         "database": args.db,
+        "clients": args.clients,
+        "client_model": "closed_loop",
         "repetitions": args.runs,
         "ef_search": (
             args.ef_search
@@ -176,7 +190,8 @@ def main():
     )
 
     output_path = output_dir / (
-        f"summary_{args.db}_{setting}_{stamp}.json"
+        f"summary_{args.db}_{setting}_"
+        f"c{args.clients}_{stamp}.json"
     )
 
     output_path.write_text(
@@ -190,4 +205,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
