@@ -13,23 +13,50 @@ from src.adapters.pgvector_adapter import PgvectorAdapter
 from src.resource_monitor import ResourceMonitor
 
 
-DATASET = Path("datasets/synthetic_10k_d128.npz")
 K = 10
 SELECTIVITIES = (100, 50, 10, 1)
+
+DATASETS = {
+    "10k": {
+        "path": Path("datasets/synthetic_10k_d128.npz"),
+        "collection": "vec3_pilot_10k",
+        "table": "vec3_pilot_10k",
+        "expected_vectors": 10000,
+        "dimensions": 128,
+    },
+    "100k": {
+        "path": Path("datasets/synthetic_100k_d128.npz"),
+        "collection": "vec3_bench_100k_d128",
+        "table": "vec3_bench_100k_d128",
+        "expected_vectors": 100000,
+        "dimensions": 128,
+    },
+}
 
 
 def recall_at_k(returned, exact):
     return len(set(returned) & set(exact)) / K
 
 
-def create_adapter(args):
+def create_adapter(args, dataset_config):
     if args.db == "chroma":
-        return ChromaAdapter()
+        return ChromaAdapter(
+            collection_name=dataset_config["collection"]
+        )
 
-    return PgvectorAdapter(ef_search=args.ef_search)
+    return PgvectorAdapter(
+        table_name=dataset_config["table"],
+        ef_search=args.ef_search,
+    )
 
 
-def warmup_worker(adapter, queries, indices, selectivity, count):
+def warmup_worker(
+    adapter,
+    queries,
+    indices,
+    selectivity,
+    count,
+):
     for j in range(count):
         i = indices[j % len(indices)]
 
@@ -40,11 +67,16 @@ def warmup_worker(adapter, queries, indices, selectivity, count):
         )
 
 
-def search_worker(adapter, queries, indices, selectivity):
+def search_worker(
+    adapter,
+    queries,
+    indices,
+    selectivity,
+):
     results = []
 
     for i in indices:
-        start = perf_counter()
+        started = perf_counter()
 
         ids = adapter.search(
             queries[i],
@@ -52,20 +84,97 @@ def search_worker(adapter, queries, indices, selectivity):
             selectivity=selectivity,
         )
 
-        latency_ms = (perf_counter() - start) * 1000
+        latency_ms = (
+            perf_counter() - started
+        ) * 1000
 
-        results.append((i, ids, latency_ms))
+        results.append(
+            (i, ids, latency_ms)
+        )
 
     return results
 
 
+def load_dataset(dataset_config):
+    dataset_path = dataset_config["path"]
+
+    if not dataset_path.is_file():
+        raise FileNotFoundError(
+            f"Dataset file does not exist: {dataset_path}"
+        )
+
+    with np.load(
+        dataset_path,
+        allow_pickle=False,
+    ) as data:
+        queries = data["queries"].copy()
+
+        ground_truths = {
+            selectivity: data[
+                f"gt_{selectivity}"
+            ].copy()
+            for selectivity in SELECTIVITIES
+        }
+
+        vectors_shape = data["vectors"].shape
+
+    expected_shape = (
+        dataset_config["expected_vectors"],
+        dataset_config["dimensions"],
+    )
+
+    if vectors_shape != expected_shape:
+        raise ValueError(
+            f"Unexpected dataset shape: "
+            f"{vectors_shape}, expected {expected_shape}"
+        )
+
+    if (
+        queries.ndim != 2
+        or queries.shape[1] != expected_shape[1]
+    ):
+        raise ValueError(
+            f"Unexpected queries shape: {queries.shape}"
+        )
+
+    if queries.dtype != np.float32:
+        raise ValueError(
+            f"Queries must be float32, got {queries.dtype}"
+        )
+
+    for selectivity, ground_truth in ground_truths.items():
+        if ground_truth.shape != (
+            len(queries),
+            K,
+        ):
+            raise ValueError(
+                f"Incorrect ground truth shape "
+                f"for {selectivity}%: "
+                f"{ground_truth.shape}"
+            )
+
+    return queries, ground_truths
+
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Development query benchmark for "
+            "Chroma and PostgreSQL/pgvector"
+        )
+    )
 
     parser.add_argument(
         "--db",
         required=True,
         choices=["chroma", "pgvector"],
+    )
+
+    parser.add_argument(
+        "--dataset",
+        choices=sorted(DATASETS),
+        default="10k",
+        help="Dataset selection (default: 10k)",
     )
 
     parser.add_argument(
@@ -90,28 +199,67 @@ def main():
     args = parser.parse_args()
 
     if args.ef_search < 1:
-        parser.error("--ef-search must be positive")
+        parser.error(
+            "--ef-search must be positive"
+        )
 
     if args.warmup_queries < 0:
-        parser.error("--warmup-queries cannot be negative")
+        parser.error(
+            "--warmup-queries cannot be negative"
+        )
 
-    with np.load(DATASET) as data:
-        queries = data["queries"].copy()
+    dataset_config = DATASETS[args.dataset]
 
-        ground_truths = {
-            s: data[f"gt_{s}"].copy()
-            for s in SELECTIVITIES
-        }
+    queries, ground_truths = load_dataset(
+        dataset_config
+    )
 
     if len(queries) < args.clients:
-        parser.error("Not enough queries for client count")
+        parser.error(
+            "Not enough queries for client count"
+        )
 
     groups = [
-        list(range(j, len(queries), args.clients))
+        list(
+            range(
+                j,
+                len(queries),
+                args.clients,
+            )
+        )
         for j in range(args.clients)
     ]
 
-    adapters = []
+    target_name = (
+        dataset_config["collection"]
+        if args.db == "chroma"
+        else dataset_config["table"]
+    )
+
+    container_name = (
+        "vec3-chroma"
+        if args.db == "chroma"
+        else "vec3-postgres"
+    )
+
+    print("\n=== QUERY RUN CONFIGURATION ===")
+    print(f"Database: {args.db}")
+    print(f"Dataset: {args.dataset}")
+    print(f"Dataset file: {dataset_config['path']}")
+    print(f"Target: {target_name}")
+    print(
+        f"Base vectors: "
+        f"{dataset_config['expected_vectors']}"
+    )
+    print(f"Dimensions: {dataset_config['dimensions']}")
+    print(f"Queries: {len(queries)}")
+    print(f"Clients: {args.clients}")
+    print(f"Warmup per client: {args.warmup_queries}")
+
+    if args.db == "pgvector":
+        print(f"ef_search: {args.ef_search}")
+
+    print()
 
     results = {
         "mode": "development_pilot",
@@ -119,13 +267,19 @@ def main():
             timezone.utc
         ).isoformat(),
         "database": args.db,
-        "dataset": DATASET.name,
+        "dataset_key": args.dataset,
+        "dataset": dataset_config["path"].name,
+        "target": target_name,
+        "base_vectors": dataset_config["expected_vectors"],
+        "dimensions": dataset_config["dimensions"],
         "queries": len(queries),
         "k": K,
         "metric": "L2",
         "clients": args.clients,
         "client_model": "closed_loop",
-        "warmup_queries_per_client_per_filter": args.warmup_queries,
+        "warmup_queries_per_client_per_filter": (
+            args.warmup_queries
+        ),
         "ef_search": (
             args.ef_search
             if args.db == "pgvector"
@@ -134,151 +288,167 @@ def main():
         "filters": {},
     }
 
-    container_name = (
-        "vec3-chroma"
-        if args.db == "chroma"
-        else "vec3-postgres"
-    )
-
+    adapters = []
     monitor = ResourceMonitor(container_name)
+    monitor_started = False
 
     try:
         adapters = [
-            create_adapter(args)
+            create_adapter(args, dataset_config)
             for _ in range(args.clients)
         ]
 
         monitor.start()
+        monitor_started = True
 
-        try:
-            with ThreadPoolExecutor(
-                max_workers=args.clients
-            ) as executor:
+        with ThreadPoolExecutor(
+            max_workers=args.clients
+        ) as executor:
 
-                for selectivity in SELECTIVITIES:
-                    warmup_futures = [
-                        executor.submit(
-                            warmup_worker,
-                            adapters[j],
-                            queries,
-                            groups[j],
-                            selectivity,
-                            args.warmup_queries,
-                        )
-                        for j in range(args.clients)
-                    ]
-
-                    for future in warmup_futures:
-                        future.result()
-
-                    workload_start = perf_counter()
-
-                    futures = [
-                        executor.submit(
-                            search_worker,
-                            adapters[j],
-                            queries,
-                            groups[j],
-                            selectivity,
-                        )
-                        for j in range(args.clients)
-                    ]
-
-                    batches = [
-                        future.result()
-                        for future in futures
-                    ]
-
-                    workload_elapsed = (
-                        perf_counter() - workload_start
+            for selectivity in SELECTIVITIES:
+                warmup_futures = [
+                    executor.submit(
+                        warmup_worker,
+                        adapters[j],
+                        queries,
+                        groups[j],
+                        selectivity,
+                        args.warmup_queries,
                     )
+                    for j in range(args.clients)
+                ]
 
-                    returned = [None] * len(queries)
-                    latencies_ms = []
+                for future in warmup_futures:
+                    future.result()
 
-                    for batch in batches:
-                        for i, ids, latency in batch:
-                            if returned[i] is not None:
-                                raise ValueError(
-                                    "Query executed more than once"
-                                )
+                workload_started = perf_counter()
 
-                            returned[i] = ids
-                            latencies_ms.append(latency)
+                futures = [
+                    executor.submit(
+                        search_worker,
+                        adapters[j],
+                        queries,
+                        groups[j],
+                        selectivity,
+                    )
+                    for j in range(args.clients)
+                ]
 
-                    if any(ids is None for ids in returned):
-                        raise ValueError("Missing query results")
+                batches = [
+                    future.result()
+                    for future in futures
+                ]
 
-                    recalls = []
-                    short_results = 0
+                workload_elapsed = (
+                    perf_counter() - workload_started
+                )
 
-                    for i, ids in enumerate(returned):
-                        if len(ids) != len(set(ids)):
+                returned = [None] * len(queries)
+                latencies_ms = []
+
+                for batch in batches:
+                    for i, ids, latency in batch:
+                        if returned[i] is not None:
                             raise ValueError(
-                                "Duplicate IDs in search results"
+                                "Query executed more than once"
                             )
 
-                        if len(ids) > K:
-                            raise ValueError(
-                                "More than K results returned"
-                            )
+                        returned[i] = ids
+                        latencies_ms.append(latency)
 
-                        if len(ids) < K:
-                            short_results += 1
+                if any(ids is None for ids in returned):
+                    raise ValueError(
+                        "Missing query results"
+                    )
 
-                        recalls.append(
-                            recall_at_k(
-                                ids,
-                                ground_truths[selectivity][i],
-                            )
+                recalls = []
+                short_results = 0
+
+                for i, ids in enumerate(returned):
+                    if len(ids) != len(set(ids)):
+                        raise ValueError(
+                            "Duplicate IDs in search results"
                         )
 
-                    mean_recall = float(np.mean(recalls))
+                    if len(ids) > K:
+                        raise ValueError(
+                            "More than K results returned"
+                        )
 
-                    p50 = float(
-                        np.percentile(latencies_ms, 50)
+                    if len(ids) < K:
+                        short_results += 1
+
+                    recalls.append(
+                        recall_at_k(
+                            ids,
+                            ground_truths[selectivity][i],
+                        )
                     )
 
-                    p95 = float(
-                        np.percentile(latencies_ms, 95)
-                    )
+                mean_recall = float(
+                    np.mean(recalls)
+                )
 
-                    p99 = float(
-                        np.percentile(latencies_ms, 99)
-                    )
+                p50 = float(
+                    np.percentile(latencies_ms, 50)
+                )
 
-                    qps = len(queries) / workload_elapsed
+                p95 = float(
+                    np.percentile(latencies_ms, 95)
+                )
 
-                    results["filters"][str(selectivity)] = {
-                        "mean_recall_at_10": mean_recall,
-                        "min_recall_at_10": float(np.min(recalls)),
-                        "max_recall_at_10": float(np.max(recalls)),
-                        "queries_with_less_than_k": short_results,
-                        "latency_p50_ms": p50,
-                        "latency_p95_ms": p95,
-                        "latency_p99_ms": p99,
-                        "qps": float(qps),
-                        "measured_duration_seconds": workload_elapsed,
-                    }
+                p99 = float(
+                    np.percentile(latencies_ms, 99)
+                )
 
-                    print(
-                        f"{args.db} | clients={args.clients} "
-                        f"| filter={selectivity}% "
-                        f"| recall@10={mean_recall:.4f} "
-                        f"| p50={p50:.2f} ms "
-                        f"| p95={p95:.2f} ms "
-                        f"| p99={p99:.2f} ms "
-                        f"| QPS={qps:.2f} "
-                        f"| short={short_results}"
-                    )
+                qps = (
+                    len(queries) / workload_elapsed
+                )
 
-        finally:
-            resource_summary = monitor.stop()
+                results["filters"][
+                    str(selectivity)
+                ] = {
+                    "mean_recall_at_10": mean_recall,
+                    "min_recall_at_10": float(
+                        np.min(recalls)
+                    ),
+                    "max_recall_at_10": float(
+                        np.max(recalls)
+                    ),
+                    "queries_with_less_than_k": (
+                        short_results
+                    ),
+                    "latency_p50_ms": p50,
+                    "latency_p95_ms": p95,
+                    "latency_p99_ms": p99,
+                    "qps": float(qps),
+                    "measured_duration_seconds": (
+                        workload_elapsed
+                    ),
+                }
+
+                print(
+                    f"{args.db} "
+                    f"| dataset={args.dataset} "
+                    f"| clients={args.clients} "
+                    f"| filter={selectivity}% "
+                    f"| recall@10={mean_recall:.4f} "
+                    f"| p50={p50:.2f} ms "
+                    f"| p95={p95:.2f} ms "
+                    f"| p99={p99:.2f} ms "
+                    f"| QPS={qps:.2f} "
+                    f"| short={short_results}",
+                    flush=True,
+                )
 
     finally:
-        if args.db == "pgvector":
+        try:
+            if monitor_started:
+                resource_summary = monitor.stop()
+        finally:
             for adapter in adapters:
-                adapter.close()
+                if args.db == "pgvector":
+                    adapter.close()
 
     results["resources"] = resource_summary
     results["resources_scope"] = (
@@ -286,17 +456,32 @@ def main():
     )
 
     print("\n=== RESOURCE MONITOR ===")
-    print(f"Samples: {resource_summary['sample_count']}")
-    print(f"Status: {resource_summary['status']}")
-    print(f"Peak RAM: {resource_summary['peak_memory_mib']}")
-    print(f"Mean CPU: {resource_summary['mean_cpu_percent']}")
+    print(
+        f"Samples: "
+        f"{resource_summary['sample_count']}"
+    )
+    print(
+        f"Status: "
+        f"{resource_summary['status']}"
+    )
+    print(
+        f"Peak RAM: "
+        f"{resource_summary['peak_memory_mib']}"
+    )
+    print(
+        f"Mean CPU: "
+        f"{resource_summary['mean_cpu_percent']}"
+    )
 
     output_dir = Path("results/pilot")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    stamp = datetime.now(timezone.utc).strftime(
-        "%Y%m%dT%H%M%S%fZ"
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
     )
+
+    stamp = datetime.now(
+        timezone.utc
+    ).strftime("%Y%m%dT%H%M%S%fZ")
 
     setting = (
         f"ef{args.ef_search}"
@@ -305,16 +490,24 @@ def main():
     )
 
     output_file = output_dir / (
-        f"query_{args.db}_{setting}_"
-        f"c{args.clients}_{stamp}.json"
+        f"query_{args.db}_"
+        f"{args.dataset}_"
+        f"{setting}_"
+        f"c{args.clients}_"
+        f"{stamp}.json"
     )
 
     output_file.write_text(
-        json.dumps(results, indent=2),
+        json.dumps(
+            results,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
-    print(f"\nResults saved to: {output_file}")
+    print(
+        f"\nResults saved to: {output_file}"
+    )
     print("QUERY RUNNER COMPLETED")
 
 
