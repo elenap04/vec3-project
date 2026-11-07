@@ -60,25 +60,19 @@ def recall_at_k(returned, exact):
     return len(set(returned) & set(exact)) / K
 
 
-def create_adapter(args, dataset_config):
+def create_adapter(args, config):
     if args.db == "chroma":
         return ChromaAdapter(
-            collection_name=dataset_config["collection"]
+            collection_name=config["collection"]
         )
 
     return PgvectorAdapter(
-        table_name=dataset_config["table"],
+        table_name=config["table"],
         ef_search=args.ef_search,
     )
 
 
-def warmup_worker(
-    adapter,
-    queries,
-    indices,
-    selectivity,
-    count,
-):
+def warmup_worker(adapter, queries, indices, selectivity, count):
     for j in range(count):
         i = indices[j % len(indices)]
 
@@ -89,12 +83,7 @@ def warmup_worker(
         )
 
 
-def search_worker(
-    adapter,
-    queries,
-    indices,
-    selectivity,
-):
+def search_worker(adapter, queries, indices, selectivity):
     results = []
 
     for i in indices:
@@ -122,19 +111,16 @@ def read_ground_truth(data):
     }
 
 
-def load_dataset(dataset_config):
-    dataset_path = dataset_config["path"]
-    ground_truth_path = dataset_config["ground_truth_path"]
+def load_dataset(config):
+    dataset_path = config["path"]
+    ground_truth_path = config["ground_truth_path"]
 
     if not dataset_path.is_file():
         raise FileNotFoundError(
             f"Dataset file does not exist: {dataset_path}"
         )
 
-    with np.load(
-        dataset_path,
-        allow_pickle=False,
-    ) as data:
+    with np.load(dataset_path, allow_pickle=False) as data:
         queries = data["queries"].copy()
         vectors_shape = data["vectors"].shape
 
@@ -148,14 +134,14 @@ def load_dataset(dataset_config):
             ground_truths = read_ground_truth(data)
 
     expected_shape = (
-        dataset_config["expected_vectors"],
-        dataset_config["dimensions"],
+        config["expected_vectors"],
+        config["dimensions"],
     )
 
     if vectors_shape != expected_shape:
         raise ValueError(
-            f"Unexpected dataset shape: "
-            f"{vectors_shape}, expected {expected_shape}"
+            f"Unexpected dataset shape: {vectors_shape}, "
+            f"expected {expected_shape}"
         )
 
     if (
@@ -163,7 +149,7 @@ def load_dataset(dataset_config):
         or queries.shape[1] != expected_shape[1]
     ):
         raise ValueError(
-            f"Unexpected queries shape: {queries.shape}"
+            f"Unexpected query shape: {queries.shape}"
         )
 
     if queries.dtype != np.float32:
@@ -174,7 +160,7 @@ def load_dataset(dataset_config):
     if not np.isfinite(queries).all():
         raise ValueError("Non-finite query vectors")
 
-    expected_queries = dataset_config.get("expected_queries")
+    expected_queries = config.get("expected_queries")
 
     if (
         expected_queries is not None
@@ -188,10 +174,7 @@ def load_dataset(dataset_config):
     if ground_truth_path is not None:
         if not ground_truth_path.is_file():
             raise FileNotFoundError(
-                "Ground truth is not ready: "
-                f"{ground_truth_path}\n"
-                "Generate exact ground truth before "
-                "running query benchmarks."
+                f"Ground truth is not ready: {ground_truth_path}"
             )
 
         with np.load(
@@ -224,8 +207,8 @@ def load_dataset(dataset_config):
     for selectivity, ground_truth in ground_truths.items():
         if ground_truth.shape != (len(queries), K):
             raise ValueError(
-                f"Incorrect ground truth shape "
-                f"for {selectivity}%: {ground_truth.shape}"
+                f"Incorrect ground truth shape for "
+                f"{selectivity}%: {ground_truth.shape}"
             )
 
         for row in ground_truth:
@@ -236,6 +219,105 @@ def load_dataset(dataset_config):
                 )
 
     return queries, ground_truths
+
+
+def execute_workload(
+    executor,
+    adapters,
+    queries,
+    groups,
+    selectivity,
+):
+    # The timed interval includes the concurrent workload,
+    # but excludes warmup and recall calculations.
+    started_at = perf_counter()
+
+    futures = [
+        executor.submit(
+            search_worker,
+            adapters[j],
+            queries,
+            groups[j],
+            selectivity,
+        )
+        for j in range(len(adapters))
+    ]
+
+    batches = [
+        future.result()
+        for future in futures
+    ]
+
+    ended_at = perf_counter()
+
+    returned = [None] * len(queries)
+    latencies_ms = []
+
+    for batch in batches:
+        for i, ids, latency in batch:
+            if returned[i] is not None:
+                raise ValueError(
+                    "Query executed more than once"
+                )
+
+            returned[i] = ids
+            latencies_ms.append(latency)
+
+    if any(ids is None for ids in returned):
+        raise ValueError("Missing query results")
+
+    return (
+        returned,
+        latencies_ms,
+        started_at,
+        ended_at,
+    )
+
+
+def calculate_query_metrics(
+    returned,
+    latencies_ms,
+    ground_truth,
+    duration,
+):
+    recalls = []
+    short_results = 0
+
+    for i, ids in enumerate(returned):
+        if len(ids) != len(set(ids)):
+            raise ValueError(
+                "Duplicate IDs in search results"
+            )
+
+        if len(ids) > K:
+            raise ValueError(
+                "More than K results returned"
+            )
+
+        if len(ids) < K:
+            short_results += 1
+
+        recalls.append(
+            recall_at_k(ids, ground_truth[i])
+        )
+
+    return {
+        "mean_recall_at_10": float(np.mean(recalls)),
+        "min_recall_at_10": float(np.min(recalls)),
+        "max_recall_at_10": float(np.max(recalls)),
+        "queries_with_less_than_k": short_results,
+        "latency_p50_ms": float(
+            np.percentile(latencies_ms, 50)
+        ),
+        "latency_p95_ms": float(
+            np.percentile(latencies_ms, 95)
+        ),
+        "latency_p99_ms": float(
+            np.percentile(latencies_ms, 99)
+        ),
+        "qps": float(len(returned) / duration),
+        "measured_duration_seconds": float(duration),
+    }
 
 
 def main():
@@ -283,16 +365,17 @@ def main():
         parser.error("--ef-search must be positive")
 
     if args.warmup_queries < 0:
-        parser.error("--warmup-queries cannot be negative")
+        parser.error(
+            "--warmup-queries cannot be negative"
+        )
 
-    dataset_config = DATASETS[args.dataset]
-
-    queries, ground_truths = load_dataset(
-        dataset_config
-    )
+    config = DATASETS[args.dataset]
+    queries, ground_truths = load_dataset(config)
 
     if len(queries) < args.clients:
-        parser.error("Not enough queries for client count")
+        parser.error(
+            "Not enough queries for client count"
+        )
 
     groups = [
         list(range(j, len(queries), args.clients))
@@ -300,9 +383,9 @@ def main():
     ]
 
     target_name = (
-        dataset_config["collection"]
+        config["collection"]
         if args.db == "chroma"
-        else dataset_config["table"]
+        else config["table"]
     )
 
     container_name = (
@@ -314,17 +397,14 @@ def main():
     print("\n=== QUERY RUN CONFIGURATION ===")
     print(f"Database: {args.db}")
     print(f"Dataset: {args.dataset}")
-    print(f"Dataset file: {dataset_config['path']}")
+    print(f"Dataset file: {config['path']}")
     print(
         "Ground truth file: "
-        f"{dataset_config['ground_truth_path'] or dataset_config['path']}"
+        f"{config['ground_truth_path'] or config['path']}"
     )
     print(f"Target: {target_name}")
-    print(
-        f"Base vectors: "
-        f"{dataset_config['expected_vectors']}"
-    )
-    print(f"Dimensions: {dataset_config['dimensions']}")
+    print(f"Base vectors: {config['expected_vectors']}")
+    print(f"Dimensions: {config['dimensions']}")
     print(f"Queries: {len(queries)}")
     print(f"Clients: {args.clients}")
     print(f"Warmup per client: {args.warmup_queries}")
@@ -339,15 +419,15 @@ def main():
         ).isoformat(),
         "database": args.db,
         "dataset_key": args.dataset,
-        "dataset": dataset_config["path"].name,
+        "dataset": config["path"].name,
         "ground_truth_file": (
-            dataset_config["ground_truth_path"].name
-            if dataset_config["ground_truth_path"]
-            else dataset_config["path"].name
+            config["ground_truth_path"].name
+            if config["ground_truth_path"]
+            else config["path"].name
         ),
         "target": target_name,
-        "base_vectors": dataset_config["expected_vectors"],
-        "dimensions": dataset_config["dimensions"],
+        "base_vectors": config["expected_vectors"],
+        "dimensions": config["dimensions"],
         "queries": len(queries),
         "k": K,
         "metric": "L2",
@@ -369,9 +449,12 @@ def main():
     monitor_started = False
     resource_summary = None
 
+    # Record the exact monotonic window of each filter.
+    workload_windows = {}
+
     try:
         adapters = [
-            create_adapter(args, dataset_config)
+            create_adapter(args, config)
             for _ in range(args.clients)
         ]
 
@@ -381,6 +464,7 @@ def main():
         with ThreadPoolExecutor(
             max_workers=args.clients
         ) as executor:
+
             for selectivity in SELECTIVITIES:
                 warmup_futures = [
                     executor.submit(
@@ -397,109 +481,51 @@ def main():
                 for future in warmup_futures:
                     future.result()
 
-                workload_started = perf_counter()
-
-                futures = [
-                    executor.submit(
-                        search_worker,
-                        adapters[j],
-                        queries,
-                        groups[j],
-                        selectivity,
-                    )
-                    for j in range(args.clients)
-                ]
-
-                batches = [
-                    future.result()
-                    for future in futures
-                ]
-
-                workload_elapsed = (
-                    perf_counter() - workload_started
+                (
+                    returned,
+                    latencies_ms,
+                    started_at,
+                    ended_at,
+                ) = execute_workload(
+                    executor,
+                    adapters,
+                    queries,
+                    groups,
+                    selectivity,
                 )
 
-                returned = [None] * len(queries)
-                latencies_ms = []
-
-                for batch in batches:
-                    for i, ids, latency in batch:
-                        if returned[i] is not None:
-                            raise ValueError(
-                                "Query executed more than once"
-                            )
-
-                        returned[i] = ids
-                        latencies_ms.append(latency)
-
-                if any(ids is None for ids in returned):
-                    raise ValueError("Missing query results")
-
-                recalls = []
-                short_results = 0
-
-                for i, ids in enumerate(returned):
-                    if len(ids) != len(set(ids)):
-                        raise ValueError(
-                            "Duplicate IDs in search results"
-                        )
-
-                    if len(ids) > K:
-                        raise ValueError(
-                            "More than K results returned"
-                        )
-
-                    if len(ids) < K:
-                        short_results += 1
-
-                    recalls.append(
-                        recall_at_k(
-                            ids,
-                            ground_truths[selectivity][i],
-                        )
-                    )
-
-                mean_recall = float(np.mean(recalls))
-                p50 = float(
-                    np.percentile(latencies_ms, 50)
+                workload_windows[selectivity] = (
+                    started_at,
+                    ended_at,
                 )
-                p95 = float(
-                    np.percentile(latencies_ms, 95)
-                )
-                p99 = float(
-                    np.percentile(latencies_ms, 99)
-                )
-                qps = len(queries) / workload_elapsed
 
-                results["filters"][str(selectivity)] = {
-                    "mean_recall_at_10": mean_recall,
-                    "min_recall_at_10": float(
-                        np.min(recalls)
-                    ),
-                    "max_recall_at_10": float(
-                        np.max(recalls)
-                    ),
-                    "queries_with_less_than_k": short_results,
-                    "latency_p50_ms": p50,
-                    "latency_p95_ms": p95,
-                    "latency_p99_ms": p99,
-                    "qps": float(qps),
-                    "measured_duration_seconds": (
-                        workload_elapsed
-                    ),
-                }
+                metrics = calculate_query_metrics(
+                    returned,
+                    latencies_ms,
+                    ground_truths[selectivity],
+                    ended_at - started_at,
+                )
+
+                results["filters"][
+                    str(selectivity)
+                ] = metrics
 
                 print(
                     f"{args.db} "
                     f"| dataset={args.dataset} "
                     f"| clients={args.clients} "
                     f"| filter={selectivity}% "
-                    f"| recall@10={mean_recall:.4f} "
-                    f"| p50={p50:.2f} ms "
-                    f"| p95={p95:.2f} ms "
-                    f"| p99={p99:.2f} ms "
-                    f"| QPS={qps:.2f} "
-                    f"| short={short_results}",
+                    f"| recall@10="
+                    f"{metrics['mean_recall_at_10']:.4f} "
+                    f"| p50="
+                    f"{metrics['latency_p50_ms']:.2f} ms "
+                    f"| p95="
+                    f"{metrics['latency_p95_ms']:.2f} ms "
+                    f"| p99="
+                    f"{metrics['latency_p99_ms']:.2f} ms "
+                    f"| QPS={metrics['qps']:.2f} "
+                    f"| short="
+                    f"{metrics['queries_with_less_than_k']}",
                     flush=True,
                 )
 
@@ -512,12 +538,35 @@ def main():
                 if args.db == "pgvector":
                     adapter.close()
 
+    # The monitor has now stopped. All collected samples
+    # are available for per-filter summaries.
+    for selectivity, window in workload_windows.items():
+        started_at, ended_at = window
+
+        filter_resources = monitor.summarize_interval(
+            started_at,
+            ended_at,
+        )
+
+        results["filters"][
+            str(selectivity)
+        ]["resources"] = filter_resources
+
+        print(
+            f"Resources | filter={selectivity}% "
+            f"| samples={filter_resources['sample_count']} "
+            f"| status={filter_resources['status']} "
+            f"| peak_ram="
+            f"{filter_resources['peak_memory_mib']} MiB",
+            flush=True,
+        )
+
     results["resources"] = resource_summary
     results["resources_scope"] = (
         "entire_run_including_warmup"
     )
 
-    print("\n=== RESOURCE MONITOR ===")
+    print("\n=== OVERALL RESOURCE MONITOR ===")
     print(
         f"Samples: {resource_summary['sample_count']}"
     )
