@@ -7,9 +7,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean, median, stdev
 
+from src.run_queries import DATASETS
+
 
 FILTERS = ("100", "50", "10", "1")
-DATASETS = ("10k", "100k")
+DATASET_KEYS = tuple(sorted(DATASETS))
 
 
 def execute_run(args, number):
@@ -146,7 +148,7 @@ def main():
 
     parser.add_argument(
         "--dataset",
-        choices=DATASETS,
+        choices=DATASET_KEYS,
         default="10k",
         help="Dataset selection (default: 10k)",
     )
@@ -198,6 +200,7 @@ def main():
     print(f"Dataset: {args.dataset}")
     print(f"Clients: {args.clients}")
     print(f"Repetitions: {args.runs}")
+
     print(
         f"Warmup queries per client per filter: "
         f"{args.warmup_queries}"
@@ -220,6 +223,7 @@ def main():
 
             for field in (
                 "dataset",
+                "ground_truth_file",
                 "target",
                 "base_vectors",
                 "dimensions",
@@ -246,6 +250,9 @@ def main():
         "database": args.db,
         "dataset_key": args.dataset,
         "dataset": reference["dataset"],
+        "ground_truth_file": reference.get(
+            "ground_truth_file"
+        ),
         "target": reference["target"],
         "base_vectors": reference["base_vectors"],
         "dimensions": reference["dimensions"],
@@ -316,9 +323,8 @@ def main():
             flush=True,
         )
 
-    # Resource measurements remain in the individual
-    # run JSON files. Each monitor covers the entire
-    # run, including warmup and all metadata filters.
+    # Resource measurements remain in individual JSON files.
+    # Each monitor covers the whole run, including warmup.
     summary["resource_measurements"] = (
         "See individual run_files. "
         "Resource monitoring covers the entire run, "

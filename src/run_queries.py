@@ -19,6 +19,7 @@ SELECTIVITIES = (100, 50, 10, 1)
 DATASETS = {
     "10k": {
         "path": Path("datasets/synthetic_10k_d128.npz"),
+        "ground_truth_path": None,
         "collection": "vec3_pilot_10k",
         "table": "vec3_pilot_10k",
         "expected_vectors": 10000,
@@ -26,10 +27,31 @@ DATASETS = {
     },
     "100k": {
         "path": Path("datasets/synthetic_100k_d128.npz"),
+        "ground_truth_path": None,
         "collection": "vec3_bench_100k_d128",
         "table": "vec3_bench_100k_d128",
         "expected_vectors": 100000,
         "dimensions": 128,
+    },
+    "1m": {
+        "path": Path("datasets/synthetic_1m_d128.npz"),
+        "ground_truth_path": None,
+        "collection": "vec3_bench_1m_d128",
+        "table": "vec3_bench_1m_d128",
+        "expected_vectors": 1000000,
+        "dimensions": 128,
+        "expected_queries": 200,
+    },
+    "agnews100k": {
+        "path": Path("datasets/agnews_100k_d384.npz"),
+        "ground_truth_path": Path(
+            "datasets/agnews_100k_d384_ground_truth.npz"
+        ),
+        "collection": "vec3_agnews_100k_d384",
+        "table": "vec3_agnews_100k_d384",
+        "expected_vectors": 100000,
+        "dimensions": 384,
+        "expected_queries": 200,
     },
 }
 
@@ -88,15 +110,21 @@ def search_worker(
             perf_counter() - started
         ) * 1000
 
-        results.append(
-            (i, ids, latency_ms)
-        )
+        results.append((i, ids, latency_ms))
 
     return results
 
 
+def read_ground_truth(data):
+    return {
+        selectivity: data[f"gt_{selectivity}"].copy()
+        for selectivity in SELECTIVITIES
+    }
+
+
 def load_dataset(dataset_config):
     dataset_path = dataset_config["path"]
+    ground_truth_path = dataset_config["ground_truth_path"]
 
     if not dataset_path.is_file():
         raise FileNotFoundError(
@@ -108,15 +136,16 @@ def load_dataset(dataset_config):
         allow_pickle=False,
     ) as data:
         queries = data["queries"].copy()
-
-        ground_truths = {
-            selectivity: data[
-                f"gt_{selectivity}"
-            ].copy()
-            for selectivity in SELECTIVITIES
-        }
-
         vectors_shape = data["vectors"].shape
+
+        source_metadata = (
+            str(data["metadata_json"])
+            if "metadata_json" in data.files
+            else None
+        )
+
+        if ground_truth_path is None:
+            ground_truths = read_ground_truth(data)
 
     expected_shape = (
         dataset_config["expected_vectors"],
@@ -142,16 +171,69 @@ def load_dataset(dataset_config):
             f"Queries must be float32, got {queries.dtype}"
         )
 
+    if not np.isfinite(queries).all():
+        raise ValueError("Non-finite query vectors")
+
+    expected_queries = dataset_config.get("expected_queries")
+
+    if (
+        expected_queries is not None
+        and len(queries) != expected_queries
+    ):
+        raise ValueError(
+            f"Expected {expected_queries} queries, "
+            f"found {len(queries)}"
+        )
+
+    if ground_truth_path is not None:
+        if not ground_truth_path.is_file():
+            raise FileNotFoundError(
+                "Ground truth is not ready: "
+                f"{ground_truth_path}\n"
+                "Generate exact ground truth before "
+                "running query benchmarks."
+            )
+
+        with np.load(
+            ground_truth_path,
+            allow_pickle=False,
+        ) as gt_data:
+            gt_metric = str(gt_data["metric"])
+            gt_k = int(gt_data["k"])
+
+            if gt_metric.lower() != "l2":
+                raise ValueError(
+                    f"Unexpected ground truth metric: {gt_metric}"
+                )
+
+            if gt_k != K:
+                raise ValueError(
+                    f"Ground truth K={gt_k}, expected {K}"
+                )
+
+            gt_metadata = str(gt_data["metadata_json"])
+
+            if gt_metadata != source_metadata:
+                raise ValueError(
+                    "Ground truth metadata does not match "
+                    "the source dataset"
+                )
+
+            ground_truths = read_ground_truth(gt_data)
+
     for selectivity, ground_truth in ground_truths.items():
-        if ground_truth.shape != (
-            len(queries),
-            K,
-        ):
+        if ground_truth.shape != (len(queries), K):
             raise ValueError(
                 f"Incorrect ground truth shape "
-                f"for {selectivity}%: "
-                f"{ground_truth.shape}"
+                f"for {selectivity}%: {ground_truth.shape}"
             )
+
+        for row in ground_truth:
+            if len(set(row.tolist())) != K:
+                raise ValueError(
+                    f"Duplicate ground truth IDs "
+                    f"for filter {selectivity}%"
+                )
 
     return queries, ground_truths
 
@@ -174,7 +256,6 @@ def main():
         "--dataset",
         choices=sorted(DATASETS),
         default="10k",
-        help="Dataset selection (default: 10k)",
     )
 
     parser.add_argument(
@@ -199,14 +280,10 @@ def main():
     args = parser.parse_args()
 
     if args.ef_search < 1:
-        parser.error(
-            "--ef-search must be positive"
-        )
+        parser.error("--ef-search must be positive")
 
     if args.warmup_queries < 0:
-        parser.error(
-            "--warmup-queries cannot be negative"
-        )
+        parser.error("--warmup-queries cannot be negative")
 
     dataset_config = DATASETS[args.dataset]
 
@@ -215,18 +292,10 @@ def main():
     )
 
     if len(queries) < args.clients:
-        parser.error(
-            "Not enough queries for client count"
-        )
+        parser.error("Not enough queries for client count")
 
     groups = [
-        list(
-            range(
-                j,
-                len(queries),
-                args.clients,
-            )
-        )
+        list(range(j, len(queries), args.clients))
         for j in range(args.clients)
     ]
 
@@ -246,6 +315,10 @@ def main():
     print(f"Database: {args.db}")
     print(f"Dataset: {args.dataset}")
     print(f"Dataset file: {dataset_config['path']}")
+    print(
+        "Ground truth file: "
+        f"{dataset_config['ground_truth_path'] or dataset_config['path']}"
+    )
     print(f"Target: {target_name}")
     print(
         f"Base vectors: "
@@ -259,8 +332,6 @@ def main():
     if args.db == "pgvector":
         print(f"ef_search: {args.ef_search}")
 
-    print()
-
     results = {
         "mode": "development_pilot",
         "timestamp_utc": datetime.now(
@@ -269,6 +340,11 @@ def main():
         "database": args.db,
         "dataset_key": args.dataset,
         "dataset": dataset_config["path"].name,
+        "ground_truth_file": (
+            dataset_config["ground_truth_path"].name
+            if dataset_config["ground_truth_path"]
+            else dataset_config["path"].name
+        ),
         "target": target_name,
         "base_vectors": dataset_config["expected_vectors"],
         "dimensions": dataset_config["dimensions"],
@@ -291,6 +367,7 @@ def main():
     adapters = []
     monitor = ResourceMonitor(container_name)
     monitor_started = False
+    resource_summary = None
 
     try:
         adapters = [
@@ -304,7 +381,6 @@ def main():
         with ThreadPoolExecutor(
             max_workers=args.clients
         ) as executor:
-
             for selectivity in SELECTIVITIES:
                 warmup_futures = [
                     executor.submit(
@@ -357,9 +433,7 @@ def main():
                         latencies_ms.append(latency)
 
                 if any(ids is None for ids in returned):
-                    raise ValueError(
-                        "Missing query results"
-                    )
+                    raise ValueError("Missing query results")
 
                 recalls = []
                 short_results = 0
@@ -385,29 +459,19 @@ def main():
                         )
                     )
 
-                mean_recall = float(
-                    np.mean(recalls)
-                )
-
+                mean_recall = float(np.mean(recalls))
                 p50 = float(
                     np.percentile(latencies_ms, 50)
                 )
-
                 p95 = float(
                     np.percentile(latencies_ms, 95)
                 )
-
                 p99 = float(
                     np.percentile(latencies_ms, 99)
                 )
+                qps = len(queries) / workload_elapsed
 
-                qps = (
-                    len(queries) / workload_elapsed
-                )
-
-                results["filters"][
-                    str(selectivity)
-                ] = {
+                results["filters"][str(selectivity)] = {
                     "mean_recall_at_10": mean_recall,
                     "min_recall_at_10": float(
                         np.min(recalls)
@@ -415,9 +479,7 @@ def main():
                     "max_recall_at_10": float(
                         np.max(recalls)
                     ),
-                    "queries_with_less_than_k": (
-                        short_results
-                    ),
+                    "queries_with_less_than_k": short_results,
                     "latency_p50_ms": p50,
                     "latency_p95_ms": p95,
                     "latency_p99_ms": p99,
@@ -457,20 +519,16 @@ def main():
 
     print("\n=== RESOURCE MONITOR ===")
     print(
-        f"Samples: "
-        f"{resource_summary['sample_count']}"
+        f"Samples: {resource_summary['sample_count']}"
     )
     print(
-        f"Status: "
-        f"{resource_summary['status']}"
+        f"Status: {resource_summary['status']}"
     )
     print(
-        f"Peak RAM: "
-        f"{resource_summary['peak_memory_mib']}"
+        f"Peak RAM: {resource_summary['peak_memory_mib']}"
     )
     print(
-        f"Mean CPU: "
-        f"{resource_summary['mean_cpu_percent']}"
+        f"Mean CPU: {resource_summary['mean_cpu_percent']}"
     )
 
     output_dir = Path("results/pilot")
@@ -498,16 +556,11 @@ def main():
     )
 
     output_file.write_text(
-        json.dumps(
-            results,
-            indent=2,
-        ),
+        json.dumps(results, indent=2),
         encoding="utf-8",
     )
 
-    print(
-        f"\nResults saved to: {output_file}"
-    )
+    print(f"\nResults saved to: {output_file}")
     print("QUERY RUNNER COMPLETED")
 
 
