@@ -63,7 +63,8 @@ def recall_at_k(returned, exact):
 def create_adapter(args, config):
     if args.db == "chroma":
         return ChromaAdapter(
-            collection_name=config["collection"]
+            collection_name=config["collection"],
+            candidate_count=args.chroma_candidates,
         )
 
     return PgvectorAdapter(
@@ -83,10 +84,11 @@ def warmup_worker(adapter, queries, indices, selectivity, count):
         )
 
 
-def search_worker(adapter, queries, indices, selectivity):
+def search_worker(adapter, queries, indices, selectivity, worker_id):
     results = []
+    progress_every = max(1, min(25, (len(indices) + 3) // 4))
 
-    for i in indices:
+    for position, i in enumerate(indices, start=1):
         started = perf_counter()
 
         ids = adapter.search(
@@ -100,6 +102,14 @@ def search_worker(adapter, queries, indices, selectivity):
         ) * 1000
 
         results.append((i, ids, latency_ms))
+
+        # Progress is printed after recording this query's latency.
+        if position % progress_every == 0 or position == len(indices):
+            print(
+                f"Progress filter={selectivity}% "
+                f"worker={worker_id}: {position}/{len(indices)}",
+                flush=True,
+            )
 
     return results
 
@@ -239,6 +249,7 @@ def execute_workload(
             queries,
             groups[j],
             selectivity,
+            j + 1,
         )
         for j in range(len(adapters))
     ]
@@ -323,7 +334,7 @@ def calculate_query_metrics(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Development query benchmark for "
+            "Query benchmark for "
             "Chroma and PostgreSQL/pgvector"
         )
     )
@@ -347,6 +358,16 @@ def main():
     )
 
     parser.add_argument(
+        "--chroma-candidates",
+        type=int,
+        default=K,
+        help=(
+            "Chroma n_results to request before retaining top 10; "
+            "default 10 (no oversampling)"
+        ),
+    )
+
+    parser.add_argument(
         "--clients",
         type=int,
         choices=[1, 8],
@@ -359,6 +380,13 @@ def main():
         default=20,
     )
 
+    parser.add_argument(
+        "--mode",
+        choices=["development_pilot", "official"],
+        default="development_pilot",
+        help="Label results and select the matching output directory",
+    )
+
     args = parser.parse_args()
 
     if args.ef_search < 1:
@@ -369,7 +397,32 @@ def main():
             "--warmup-queries cannot be negative"
         )
 
+    if args.chroma_candidates < K:
+        parser.error(
+            f"--chroma-candidates must be at least {K}"
+        )
+
+    if args.db != "chroma" and args.chroma_candidates != K:
+        parser.error(
+            "--chroma-candidates applies only to Chroma"
+        )
+
     config = DATASETS[args.dataset]
+
+    # This runner runs all four filters. Reject settings that could
+    # request more neighbors than the 1% filter contains.
+    if args.db == "chroma":
+        smallest_filter = min(SELECTIVITIES)
+        minimum_eligible = (
+            config["expected_vectors"] * smallest_filter // 100
+        )
+        if args.chroma_candidates > minimum_eligible:
+            parser.error(
+                f"--chroma-candidates={args.chroma_candidates} "
+                f"exceeds {minimum_eligible} eligible vectors "
+                f"for the {smallest_filter}% filter"
+            )
+
     queries, ground_truths = load_dataset(config)
 
     if len(queries) < args.clients:
@@ -408,12 +461,16 @@ def main():
     print(f"Queries: {len(queries)}")
     print(f"Clients: {args.clients}")
     print(f"Warmup per client: {args.warmup_queries}")
+    print(f"Mode: {args.mode}")
 
     if args.db == "pgvector":
         print(f"ef_search: {args.ef_search}")
+    else:
+        print(f"Chroma n_results: {args.chroma_candidates}")
+        print("Recall evaluated on returned top 10")
 
     results = {
-        "mode": "development_pilot",
+        "mode": args.mode,
         "timestamp_utc": datetime.now(
             timezone.utc
         ).isoformat(),
@@ -441,6 +498,16 @@ def main():
             if args.db == "pgvector"
             else None
         ),
+        "chroma_candidates": (
+            args.chroma_candidates
+            if args.db == "chroma"
+            else None
+        ),
+        "search_strategy": (
+            "chroma_oversampling_top10"
+            if args.db == "chroma" and args.chroma_candidates > K
+            else "standard_top10"
+        ),
         "filters": {},
     }
 
@@ -458,6 +525,17 @@ def main():
             for _ in range(args.clients)
         ]
 
+        if args.db == "chroma":
+            # Record actual collection configuration, rather than treating
+            # requested n_results as a substitute for the HNSW parameters.
+            hnsw_config = adapters[0].collection.configuration["hnsw"]
+            if hnsw_config["space"] != "l2":
+                raise ValueError(
+                    f"Expected L2 Chroma index, got {hnsw_config['space']!r}"
+                )
+            results["chroma_hnsw_configuration"] = hnsw_config
+            print(f"Chroma HNSW: {hnsw_config}", flush=True)
+
         monitor.start()
         monitor_started = True
 
@@ -466,6 +544,11 @@ def main():
         ) as executor:
 
             for selectivity in SELECTIVITIES:
+                print(
+                    f"\nSTART filter={selectivity}% "
+                    f"queries={len(queries)} clients={args.clients}",
+                    flush=True,
+                )
                 warmup_futures = [
                     executor.submit(
                         warmup_worker,
@@ -580,7 +663,10 @@ def main():
         f"Mean CPU: {resource_summary['mean_cpu_percent']}"
     )
 
-    output_dir = Path("results/pilot")
+    output_dir = Path(
+        "results/official" if args.mode == "official"
+        else "results/pilot"
+    )
     output_dir.mkdir(
         parents=True,
         exist_ok=True,
@@ -593,7 +679,7 @@ def main():
     setting = (
         f"ef{args.ef_search}"
         if args.db == "pgvector"
-        else "default"
+        else f"candidates{args.chroma_candidates}"
     )
 
     output_file = output_dir / (
