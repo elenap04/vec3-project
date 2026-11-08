@@ -9,7 +9,7 @@ from time import perf_counter
 
 
 MIN_SAMPLES = 3
-DEFAULT_SAMPLE_INTERVAL_SECONDS = 0.1
+DEFAULT_SAMPLE_INTERVAL_SECONDS = 0.05
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
@@ -123,6 +123,7 @@ class ResourceMonitor:
             )
 
         self.container_name = container_name
+
         self.sample_interval_seconds = float(
             sample_interval_seconds
         )
