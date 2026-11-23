@@ -1,52 +1,55 @@
 # Vec3 — Experimental Protocol
 
-Updated: 2026-11-22
+Updated: 2026-11-23
 
 ## 1. Research objective
 
-Compare Chroma and PostgreSQL/pgvector as complete vector
-database systems using common datasets and documented
-experimental conditions.
+Compare Chroma and PostgreSQL/pgvector as vector
+database systems under documented experimental
+conditions.
 
-Evaluation dimensions:
+The evaluation covers:
 - Recall@10 against exact ground truth
-- Latency: p50, p95 and exploratory p99
-- Query throughput (QPS)
-- Metadata filtering
+- Query latency and throughput
+- Metadata-filter selectivity
 - Concurrent clients
 - CPU and RAM consumption
 - Dataset scalability
+- ANN search-parameter trade-offs
 - Ingestion and index construction
 - Storage footprint
-- Recall-Latency trade-offs
-- Cold/warm and constrained-memory behavior
+- Cold/warm execution
+- Constrained-memory behavior
 
-Completed and pending experiments are distinguished below.
+Completed experiments and remaining work are
+distinguished throughout this document.
 
-## 2. Environment
+## 2. Experimental environment
 
-Baseline experiments were performed on one Debian laptop.
+The selected benchmarks ran on a single laptop.
 
-Recorded environment:
+Environment:
 - Debian 13
 - Intel Core i7-8550U
-- 8 logical CPUs
+- Four physical cores
+- Eight logical CPUs
 - Approximately 15 GiB RAM
 - Local SSD
-- Docker
+- Docker and Docker Compose
 - Chroma 1.5.9
 - PostgreSQL 17
 - pgvector 0.8.7
 
-Both databases ran in Docker containers on the same host.
+Both systems ran in containers on the same host.
 
-No explicit Docker CPU or RAM limits were configured.
+No explicit Docker CPU or memory limits were applied
+during the baseline or Recall-Latency experiments.
 
-Benchmark workloads were executed sequentially.
-Unrelated demanding applications were avoided during
-the selected official benchmark sessions.
+Experiments were executed sequentially.
 
-The shared host was not completely isolated.
+The host was not completely isolated, so operating
+system activity and other environmental effects
+remain possible sources of measurement variability.
 
 ## 3. Datasets
 
@@ -57,157 +60,90 @@ The shared host was not completely isolated.
 | Synthetic 1M | 1,000,000 | 128 |
 | AG News 100K | 100,000 | 384 |
 
-Synthetic datasets use reproducible generation settings.
+AG News embeddings were produced with
+BAAI/bge-small-en-v1.5.
 
-AG News source: fancyzhx/ag_news
-Embedding model: BAAI/bge-small-en-v1.5
+Synthetic 10K was used for preliminary development
+and correctness experiments.
 
-Synthetic 10K was used for preliminary experiments
-and is not included in the selected official baselines.
-
-Official baseline datasets:
+The three official baseline datasets were:
 - Synthetic 100K
 - Synthetic 1M
 - AG News 100K
 
-## 4. Correctness and filters
+The additional Recall-Latency sweeps were performed
+on Synthetic 1M only.
 
-Primary baseline distance metric: L2.
+## 4. Exact ground truth and filtering
 
-Each official dataset has 200 query vectors and exact
-ground truth computed independently of both databases.
+The primary evaluation distance metric is L2.
 
-Recall@10 compares returned identifiers with the exact
-top-10 neighbors under each filter condition.
+Recall@10 measures the overlap between the returned
+top-ten identifiers and exact top-ten nearest neighbors.
+
+Official experiments use 200 measured queries per
+filter and run.
 
 Filter selectivities:
-- 100%: unfiltered
+- 100%: no metadata filter
 - 50%
 - 10%
 - 1%
 
-Filtering uses bucket metadata.
+Filtered queries select vectors using bucket metadata.
 
-For AG News, filtering is not based on news categories.
+For AG News, bucket filtering is not equivalent to
+filtering by news category.
 
-Filtered ground truth is computed separately for each
-eligible subset.
+Exact ground truth is computed separately for each
+eligible filtered subset.
 
-## 5. HNSW configuration
+## 5. HNSW index construction
 
-Common construction parameters:
-- M / max_neighbors: 16
+Common index construction settings:
+- Maximum neighbors / M: 16
 - ef_construction: 100
 - Distance metric: L2
 
-PostgreSQL/pgvector baseline:
-- hnsw.ef_search = 200
+These settings were held fixed in the selected
+baseline and Synthetic 1M Recall-Latency experiments.
 
-Chroma baseline:
-- HNSW ef_search = 100
+The search-time configurations differ by database
+and by experimental phase.
+
+## 6. Initial official baseline campaign
+
+The selected baseline campaign contains:
+- Three datasets
+- Two database systems
+- One and eight concurrent closed-loop clients
+- Four metadata-filter selectivities
+- Five repetitions per configuration
+
+Baseline totals:
+- 12 selected official series
+- 60 verified official runs
+- 240 per-run/filter observations
+- 48 configuration/filter summary rows
+
+For each run:
+- k = 10
+- 200 measured queries per filter
+- 20 warm-up queries per client and filter
+- Four filter selectivities
+
+Baseline PostgreSQL setting:
+- HNSW ef_search = 200
+
+Baseline Chroma setting:
+- Collection HNSW ef_search = 100
 - n_results = 10
 - No additional candidate oversampling
 
-The generic ef_search value printed by the common
-runner is not applied to Chroma.
+The configurations were not selected to have
+equal Recall@10.
 
-Chroma search configuration belongs to the collection.
-
-These configurations do not necessarily have equal
-Recall@10 and must not be presented as recall-matched.
-
-## 6. Official baseline workloads
-
-Completed configurations:
-- 3 official datasets
-- 2 database systems
-- 1 and 8 concurrent clients
-- 5 repetitions per configuration
-
-Totals:
-- 12 selected official series
-- 60 validated official runs
-- 240 per-run/filter observations
-
-Each run used:
-- 200 measured queries per filter
-- 4 filter selectivities
-- 20 warm-up queries per client and filter
-- k = 10
-- Closed-loop client model
-
-With 8 clients, measured queries were distributed
-across clients.
-
-Warm-up queries were excluded from measured latency
-and throughput.
-
-## 7. Repetitions and statistics
-
-Each selected configuration has five completed
-and validated repetitions.
-
-Recorded statistics include:
-- Recall@10
-- QPS
-- Latency p50, p95 and p99
-- Mean and median
-- Standard deviation
-- Estimated 95% confidence intervals
-- Container CPU and RAM measurements
-
-Confidence intervals describe observed variability
-across five repeated runs.
-
-Since each filter has only 200 measured queries per run,
-p99 estimates are exploratory.
-
-Development pilots are excluded from official results.
-
-## 8. Resource monitoring
-
-Resource monitoring uses Linux cgroups v2 statistics.
-
-CPU percentages are expressed in logical-core
-equivalents. Approximately 100% corresponds to one
-fully utilized logical CPU.
-
-Memory is an approximation of container working-set
-usage, not memory uniquely attributable to one query
-or dataset.
-
-Resource measurements are collected per filter.
-
-The selected Synthetic 100K PostgreSQL 1-client series
-used a sampling interval of 100 ms.
-
-Other selected baseline series used 50 ms.
-
-Short measurement windows may contain relatively few
-samples. A resource status of OK confirms the minimum
-validation requirements, not perfect measurement
-precision.
-
-## 9. Official session selection
-
-The final baseline export includes only 12 explicitly
-selected and verified benchmark sessions.
-
-Required checks:
-- Correct database and dataset
-- Correct client count
-- Five completed runs
-- Four filters per run
-- Completed query runner logs
-- Five valid resource runs per filter
-- Correct source session identification
-
-Superseded, interrupted and nonstandard executions
-are excluded from the selected baseline results.
-
-They are preserved locally rather than deleted.
-
-Selected results and provenance:
+Selected baseline exports:
 - reports/baselines/manifest.csv
 - reports/baselines/per_run.csv
 - reports/baselines/summary.csv
@@ -216,52 +152,245 @@ Selected results and provenance:
 Export script:
 - scripts/export_official_baselines.py
 
-Raw result JSON files and logs must be preserved
-and backed up separately.
+## 7. Additional official Recall-Latency sweeps
 
-## 10. Additional experiments — not yet completed
+Four additional official series were completed on
+Synthetic 1M with one closed-loop client.
 
-The following remain part of the study:
+Each series used:
+- Five repetitions
+- Four filter selectivities
+- 200 measured queries per filter and run
+- 20 warm-up queries per client and filter
+- L2 distance
+- Exact Recall@10
+- k = 10
 
-1. Recall-Latency and ANN parameter sweeps.
-   Test meaningful search settings for both systems
-   and identify comparable Recall@10 levels where
-   these are achievable.
+PostgreSQL/pgvector:
+- Baseline: HNSW ef_search = 200
+- Additional series: ef_search = 400
+- Additional series: ef_search = 1000
 
-2. Additional distance metrics.
-   Evaluate cosine and inner product with compatible
-   indexes and suitable ground truth.
+Chroma:
+- Baseline: HNSW ef_search = 100, n_results = 10
+- Additional series: HNSW ef_search = 100,
+  n_results = 200
+- Additional series: HNSW ef_search = 100,
+  n_results = 400
 
-3. Ingestion and indexing.
-   Measure ingestion, index construction, readiness,
-   storage footprint and resource consumption with
-   clearly documented timing boundaries.
+For Chroma oversampling, the client requests
+n_results candidates and retains only the first
+ten identifiers for Recall@10 evaluation.
 
-4. Cold/warm experiments.
-   Define reproducible cache-state conditions.
+The entire Chroma request is included in timing.
 
-5. Constrained-memory experiments.
-   Apply documented, comparable memory limits and
-   record performance changes or failures.
+The Chroma n_results parameter is not equivalent
+to PostgreSQL's HNSW ef_search parameter.
 
-6. Additional scalability and resource analysis.
-   Account for short measurement windows and
-   shared-host limitations.
+These experiments compare the Recall-Latency
+trade-offs of two different search strategies.
 
-7. Statistical analysis, visualizations and reporting.
+The four new series contain:
+- 20 verified official runs
+- 80 per-run/filter observations
+- 16 configuration/filter summary rows
 
-Completion of the 12 baseline series does not mean
-that these additional experiments are complete.
+Selected sweep exports:
+- reports/sweeps/manifest.csv
+- reports/sweeps/per_run.csv
+- reports/sweeps/summary.csv
+- reports/sweeps/README.md
 
-## 11. Reporting principles
+Export script:
+- scripts/export_official_sweeps.py
 
-Final comparisons must:
-- Preserve the actual database configurations.
-- Show Recall@10 alongside latency and throughput.
-- Distinguish measured results from hypotheses.
+## 8. Overall completed official experiments
+
+Combining baselines and additional sweeps:
+
+- 16 selected official series
+- 80 verified official runs
+- 320 per-run/filter observations
+- 64 configuration/filter summary rows
+
+These counts describe the selected experiments,
+not all historical development pilots.
+
+Raw experimental sessions remain local and are
+excluded from the Git repository.
+
+## 9. Chroma configuration diagnostics
+
+The actual HNSW configuration was retrieved from
+the Chroma collection.
+
+For Synthetic 1M, the original collection used:
+- HNSW ef_search = 100
+- ef_construction = 100
+- max_neighbors = 16
+- L2 distance
+
+A diagnostic confirmed that Chroma 1.5.9 accepted
+a temporary change of ef_search from 100 to 200.
+
+The configuration was restored to 100 and the
+collection still contained 1,000,000 vectors.
+
+Additional diagnostics tested configured ef_search
+values of 100, 400 and 1000.
+
+For the small set of queries examined, the returned
+top-ten identifiers did not change across these
+configured values.
+
+This observation does not establish whether the
+search algorithm used the updated setting internally.
+
+Consequently, the selected official Chroma sweeps
+used n_results oversampling while keeping the
+collection HNSW ef_search fixed at 100.
+
+Diagnostic queries showed that increasing n_results
+to 400 could improve Recall@10 at the cost of
+additional latency.
+
+Diagnostic timings are not mixed with official
+benchmark results.
+
+The common runner's generic ef_search CLI default
+does not configure Chroma's collection.
+
+For Chroma, the actual HNSW collection configuration
+was verified in the underlying run JSON files.
+
+## 10. Experimental interpretation
+
+The additional PostgreSQL series showed higher
+Recall@10 with increased ef_search.
+
+The additional Chroma oversampling series showed
+higher Recall@10 with increased n_results.
+
+The cost in latency depends on the filter condition.
+
+In particular, Chroma already exhibited high
+filtered-query latency in its original baseline.
+
+The cause of that behavior has not been established.
+
+Cross-system performance should be compared at
+similar observed Recall@10 levels where possible.
+
+Numerically matching ef_search and n_results
+would not constitute a fair parameter match.
+
+Comparisons should report accuracy, latency and
+throughput together, including variability.
+
+The official summaries retain per-setting and
+per-filter measurements for this purpose.
+
+## 11. Repetitions and statistics
+
+Every selected official series contains five runs.
+
+Reported statistics include:
+- Mean and median
+- Standard deviation
+- Estimated 95% confidence intervals
+- Recall@10
+- QPS
+- Latency p50, p95 and p99
+
+Intervals summarize variability across five runs.
+
+The fixed query workload can produce identical
+Recall@10 values across repeated runs.
+
+Because only 200 measured queries are executed per
+filter and run, p99 estimates are exploratory.
+
+Development pilots are excluded from official
+aggregate results.
+
+## 12. CPU and RAM monitoring
+
+Resource measurements use Linux cgroups v2.
+
+CPU percentages use logical-core equivalents.
+Approximately 100% represents one fully utilized
+logical CPU.
+
+Memory is an approximation of container working-set
+usage, not memory uniquely attributable to a query.
+
+The selected Synthetic 100K PostgreSQL one-client
+baseline used a resource sampling interval of 100 ms.
+
+The other selected baseline series used 50 ms.
+
+The additional selected sweeps used the same
+monitoring framework.
+
+Short query windows can produce relatively few
+resource samples.
+
+A resource status of OK indicates that the
+configured validation criteria were met.
+It does not guarantee perfect measurement precision.
+
+## 13. Validation and provenance
+
+The selected experiments were checked for:
+- Correct database and dataset
+- Correct client count
+- Correct search configuration
+- Five completed repetitions
+- Four filter summaries
+- Twenty per-run/filter rows per series
+- Valid resource status for every run and filter
+- Completed query-runner logs
+
+The sweep exporter additionally verifies the
+underlying run configuration records.
+
+Export manifests retain source session identifiers
+and SHA-256 hashes of source summary JSON files.
+
+Superseded, interrupted and development runs are
+not included in the selected official exports.
+
+Raw results and logs should be backed up separately.
+
+## 14. Remaining experiments
+
+The baseline and Synthetic 1M Recall-Latency
+campaigns are complete.
+
+The overall project is not yet finished.
+
+Remaining experimental and reporting tasks:
+- Additional distance metrics
+- Ingestion and index-construction timing
+- Disk-footprint measurement
+- Cold versus warm behavior
+- Constrained-memory experiments
+- Additional resource analysis
+- Statistical analysis and visualization
+- Final written report and conclusions
+
+These tasks must not be represented as completed
+until their evidence has been collected and checked.
+
+## 15. Reporting principles
+
+Final reporting should:
+- Preserve actual configurations and provenance.
+- Distinguish official data from pilot observations.
+- Report Recall@10 together with latency and QPS.
+- Discuss measurement variability.
 - Avoid unsupported causal explanations.
-- Report variability and measurement limitations.
-- Identify unattainable recall targets honestly.
-- Separate pilots from official results.
-- Preserve source session identifiers.
-- Keep complete raw records for reproducibility.
+- Explain the different search parameters.
+- Identify unavailable recall-matched comparisons.
+- Explain the limitations of the shared host.
+- Preserve raw records for reproducibility.

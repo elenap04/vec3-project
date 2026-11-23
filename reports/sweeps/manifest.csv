@@ -1,0 +1,5 @@
+dataset,database,clients,parameter,value,actual_hnsw_ef_search,chroma_n_results,search_configuration,session_id,runs,filters,queries_per_filter_per_run,warmup_per_client_per_filter,source_summary_sha256
+1m,pgvector,1,ef_search,400,400,,pgvector HNSW ef_search=400,20261122T013949894595Z_d4ebab5d,5,"100,50,10,1",200,20,87b45a0bc15de16b71ddeed3651d24a15ae3dc190e509c963fcfc581d5b6ac2f
+1m,pgvector,1,ef_search,1000,1000,,pgvector HNSW ef_search=1000,20261122T013021548193Z_a9879a49,5,"100,50,10,1",200,20,548c26b4afaaf2abef1b26fb2a3e33e9f873876e3246f700f6cf57a71ff35b98
+1m,chroma,1,n_results,200,100,200,Chroma HNSW ef_search=100; n_results=200; top 10 retained,20261123T015414794871Z_d2604575,5,"100,50,10,1",200,20,ef67c97d4e1984afe98cfaa13740250da3778f552a26c40970b41e4b61b0aad6
+1m,chroma,1,n_results,400,100,400,Chroma HNSW ef_search=100; n_results=400; top 10 retained,20261122T233433032043Z_4d68844c,5,"100,50,10,1",200,20,e32db5bf30f8b934b83baed4e5999a081cd4c8f873165eb1b818a4091ec6803d
